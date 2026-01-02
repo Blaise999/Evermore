@@ -3,7 +3,7 @@ const AuditLog = require("../models/AuditLog");
 async function auditLog({
   actorId,
   actorRole,
-  action,
+  actions,
   targetModel,
   targetId,
   before,
