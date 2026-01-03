@@ -1,5 +1,6 @@
 // routes/admin.js
 const express = require("express");
+const mongoose = require("mongoose");
 
 const auth = require("../middleware/auth");
 const requireRole = require("../middleware/requireRole");
@@ -86,18 +87,18 @@ async function sendBrandedEmailToUser({ req, res, userId, subject, message, cta,
   let data = null;
   try {
     const out = await resend.emails.send({
-    from,
-    to: [String(user.email).toLowerCase().trim()],
-    subject: String(subject).trim(),
-    html,
-    text,
-    replyTo,
-    tags: [
-      { name: "source", value: "admin" },
-      { name: "user_id", value: String(userId) },
-      { name: "template", value: String(templateId || "general") },
-      ...extraTags,
-    ],
+      from,
+      to: [String(user.email).toLowerCase().trim()],
+      subject: String(subject).trim(),
+      html,
+      text,
+      replyTo,
+      tags: [
+        { name: "source", value: "admin" },
+        { name: "user_id", value: String(userId) },
+        { name: "template", value: String(templateId || "general") },
+        ...extraTags,
+      ],
     });
     data = out?.data || null;
     const error = out?.error;
@@ -161,8 +162,6 @@ async function sendBrandedEmailToUser({ req, res, userId, subject, message, cta,
   return res.json({ ok: true, id: data?.id || null });
 }
 
-// ✅ NEW route (matches admin UI)
-
 // ✅ Message history (for admin UI)
 // GET /api/admin/users/:id/messages
 router.get(
@@ -174,10 +173,7 @@ router.get(
     const user = await User.findById(userId).select("_id email").lean();
     if (!user?._id) throw new AppError("User not found", 404);
 
-    const items = await AdminMessage.find({ userId })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
+    const items = await AdminMessage.find({ userId }).sort({ createdAt: -1 }).limit(50).lean();
 
     return res.json({
       ok: true,
@@ -213,9 +209,9 @@ router.post(
   })
 );
 
-// ---------------------------
-// CareFlex (Option A) helpers
-// ---------------------------
+/* ========================================================================== */
+/*  CareFlex (Option A) helpers                                               */
+/* ========================================================================== */
 function n2(num) {
   const n = Number(num);
   if (!Number.isFinite(n)) return 0;
@@ -229,9 +225,7 @@ function invoiceBalanceDue(inv) {
 }
 
 async function computeOutstandingOwedEUR(userId) {
-  const docs = await Invoice.find({ userId, status: { $ne: "void" } })
-    .select("total coveredAmount status")
-    .lean();
+  const docs = await Invoice.find({ userId, status: { $ne: "void" } }).select("total coveredAmount status").lean();
 
   let owed = 0;
   for (const inv of docs) {
@@ -341,6 +335,9 @@ function randomBetween(from, to) {
   return new Date(t);
 }
 
+/* ========================================================================== */
+/*  USERS                                                                     */
+/* ========================================================================== */
 /**
  * ADMIN: list users
  */
@@ -367,9 +364,7 @@ router.get(
     ]);
 
     const userIds = userDocs.map((u) => u._id);
-    const profiles = await PatientProfile.find({ userId: { $in: userIds } })
-      .select("userId patientId fullName email phone")
-      .lean();
+    const profiles = await PatientProfile.find({ userId: { $in: userIds } }).select("userId patientId fullName email phone").lean();
     const pByUserId = new Map(profiles.map((p) => [String(p.userId), p]));
 
     const items = userDocs.map((u) => {
@@ -819,9 +814,7 @@ router.post(
 
     const status = body.status ? String(body.status) : "issued";
     const issuedAt = body.issuedAt ? new Date(body.issuedAt) : new Date();
-    const dueDate = body.dueDate
-      ? new Date(body.dueDate)
-      : new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const dueDate = body.dueDate ? new Date(body.dueDate) : new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
 
     const invoiceNo = String(body.invoiceNo || "").trim() || makeRequestRef("INV");
 
@@ -1159,11 +1152,25 @@ router.post(
   })
 );
 
+/* ========================================================================== */
+/*  SEED / POPULATE USER DATA                                                 */
+/* ========================================================================== */
 /**
  * ADMIN: bulk-create user data
+ * POST /api/admin/users/:id/populate
+ *
+ * NEW: supports reset
+ *   - query: ?reset=1 or ?force=1
+ *   - body:  { reset: true }
+ *
+ * "reset" deletes existing appointments/records/invoices/payments for that user first.
  */
 async function bulkCreateUserDataHandler(req, res) {
-  const user = await User.findById(req.params.id);
+  // Validate user id early so you don’t get CastErrors
+  const id = String(req.params.id || "");
+  if (!mongoose.Types.ObjectId.isValid(id)) throw new AppError("Invalid user id", 400);
+
+  const user = await User.findById(id);
   if (!user) throw new AppError("User not found", 404);
 
   await ensureProfileForUser(user);
@@ -1171,11 +1178,23 @@ async function bulkCreateUserDataHandler(req, res) {
 
   const body = req.body || {};
 
+  const reset =
+    body.reset === true ||
+    String(req.query.reset || "") === "1" ||
+    String(req.query.force || "") === "1";
+
+  if (reset) {
+    await Promise.all([
+      Appointment.deleteMany({ userId: user._id }),
+      Record.deleteMany({ userId: user._id }),
+      Invoice.deleteMany({ userId: user._id }),
+      PaymentRequest.deleteMany({ userId: user._id }),
+    ]);
+  }
+
   const legacyCount = Math.min(50, Math.max(1, Number(body.count || 3)));
   const counts = {
-    appointments: Number(
-      body?.counts?.appointments ?? body.appointmentsCount ?? (body.appointments !== false ? legacyCount : 0)
-    ),
+    appointments: Number(body?.counts?.appointments ?? body.appointmentsCount ?? (body.appointments !== false ? legacyCount : 0)),
     records: Number(body?.counts?.records ?? body.recordsCount ?? (body.records !== false ? legacyCount : 0)),
     invoices: Number(body?.counts?.invoices ?? body.invoicesCount ?? (body.invoices !== false ? legacyCount : 0)),
   };
@@ -1196,7 +1215,10 @@ async function bulkCreateUserDataHandler(req, res) {
     body.from ||
     new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000).toISOString();
   const toDateRaw =
-    body.toDate || body.endDate || body.to || new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    body.toDate ||
+    body.endDate ||
+    body.to ||
+    new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
   if (Number.isNaN(Date.parse(String(fromDateRaw))) || Number.isNaN(Date.parse(String(toDateRaw)))) {
     throw new AppError("fromDate/toDate must be valid ISO date strings", 400);
@@ -1316,13 +1338,40 @@ async function bulkCreateUserDataHandler(req, res) {
     action: "ADMIN_BULK_CREATE_USER_DATA",
     targetModel: "User",
     targetId: String(user._id),
-    after: { created, flags, counts, fromDate, toDate },
+    after: { created, flags, counts, fromDate, toDate, reset },
     ip: req.ip,
     userAgent: req.headers["user-agent"],
   });
 
-  res.json({ ok: true, created, fromDate, toDate });
+  res.json({ ok: true, created, fromDate, toDate, reset });
 }
+
+/**
+ * ✅ NEW: /seed (alias for populate)
+ * Works with GET and POST because your error showed GET.
+ *
+ * GET  /api/admin/users/:id/seed
+ * POST /api/admin/users/:id/seed
+ *
+ * Defaults: reset=true, count=3
+ * You can override in POST body.
+ */
+router.get(
+  "/users/:id/seed",
+  asyncHandler(async (req, res) => {
+    req.body = Object.assign({}, req.body || {}, { count: 3, reset: true });
+    return bulkCreateUserDataHandler(req, res);
+  })
+);
+
+router.post(
+  "/users/:id/seed",
+  asyncHandler(async (req, res) => {
+    req.body = Object.assign({ count: 3 }, req.body || {});
+    if (req.body.reset === undefined) req.body.reset = true;
+    return bulkCreateUserDataHandler(req, res);
+  })
+);
 
 router.post("/users/:id/populate", asyncHandler(bulkCreateUserDataHandler));
 
