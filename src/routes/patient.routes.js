@@ -14,8 +14,66 @@ const PaymentRequest = require("../models/PaymentRequest");
 const { makeRequestRef } = require("../utils/refs");
 const { auditLog } = require("../utils/audit");
 
+// OTP (used for booking step-up)
+const { generateOtp, hashOtp, otpExpiresAt, isOtpExpired, safeEqualHex } = require("../utils/otp");
+const { getResend } = require("../utils/resendClient");
+const { renderBrandedEmail } = require("../utils/brand");
+const { sendMail } = require("../utils/mailer");
+
 const router = express.Router();
 router.use(auth);
+
+// ---------------------------
+// OTP helpers (booking step-up)
+// ---------------------------
+async function sendOtpEmail(to, otp, { purpose = "booking" } = {}) {
+  const minutes = Number(process.env.OTP_TTL_MINUTES || 10);
+  const subject = `Your Evermore ${String(purpose)} code`;
+  const message =
+    `Use this code to continue: ${otp}\n\n` +
+    `It expires in ${minutes} minutes.\n\n` +
+    `If you didn’t request this, ignore this email.`;
+
+  const { html, text } = renderBrandedEmail({ subject, message });
+
+  const recipient = String(to || "").toLowerCase().trim();
+  if (!recipient) throw new Error("Missing OTP recipient email");
+
+  const replyTo = process.env.MAIL_REPLY_TO || undefined;
+
+  // Prefer Resend if configured
+  if (process.env.RESEND_API_KEY && process.env.MAIL_FROM) {
+    const resend = await getResend();
+    const { error } = await resend.emails.send({
+      from: process.env.MAIL_FROM,
+      to: [recipient],
+      subject,
+      html,
+      text,
+      replyTo,
+      tags: [
+        { name: "type", value: "otp" },
+        { name: "purpose", value: String(purpose) },
+      ],
+    });
+
+    if (error) throw new Error(error.message || "Resend failed");
+    return { via: "resend" };
+  }
+
+  // Fallback to SMTP if configured
+  try {
+    await sendMail({ to: recipient, subject, html, text, replyTo });
+    return { via: "smtp" };
+  } catch (err) {
+    // Dev fallback: show OTP in console so you can keep moving locally
+    if (process.env.NODE_ENV !== "production" || String(process.env.OTP_DEBUG || "false") === "true") {
+      console.log(`🔐 OTP (${purpose}) for ${recipient}:`, otp);
+      return { via: "console" };
+    }
+    throw err;
+  }
+}
 
 // ---------------------------
 // CareFlex (Option A) helpers
@@ -207,7 +265,17 @@ router.post(
   asyncHandler(async (req, res) => {
     const userId = req.user.id;
 
-    const { dept, clinician, facility, startISO, notes, estimatedCostEUR, estimatedCostGBP, paymentMethod } = req.body || {};
+    const {
+      otp,
+      dept,
+      clinician,
+      facility,
+      startISO,
+      notes,
+      estimatedCostEUR,
+      estimatedCostGBP,
+      paymentMethod,
+    } = req.body || {};
 
     const department = String(dept || "").trim();
     const doctorName = String(clinician || "").trim();
@@ -219,11 +287,68 @@ router.post(
     if (!whenISO || Number.isNaN(Date.parse(whenISO))) throw new AppError("Valid startISO required", 400);
     if (!Number.isFinite(amt) || amt <= 0) throw new AppError("Valid estimatedCostEUR required", 400);
 
-    // Fetch user for hospitalId (required by Invoice schema)
-    const user = await User.findById(userId).lean();
+    // Fetch user (DOCUMENT) for hospitalId + OTP persistence
+    const user = await User.findById(userId);
     if (!user) throw new AppError("User not found", 404);
+
     const hospitalId = String(user.hospitalId || "").trim();
     if (!hospitalId) throw new AppError("User hospitalId missing (required for invoice)", 400);
+
+    // Toggle: require OTP for booking (default: true)
+    const requireOtp = String(process.env.BOOKING_OTP_REQUIRED || "true") !== "false";
+    const purpose = "portal_stepup";
+
+    // If OTP is required and not provided, issue OTP and stop.
+    if (requireOtp && !String(otp || "").trim()) {
+      const code = generateOtp();
+
+      user.otpPurpose = purpose;
+      user.otpHash = hashOtp({ otp: code, userId: user._id, purpose });
+      user.otpExpiresAt = otpExpiresAt();
+      user.otpAttempts = 0;
+      await user.save();
+
+      // Send email (falls back to SMTP if Resend isn't configured).
+      // In dev, it can also fall back to console when mail isn't configured.
+      await sendOtpEmail(user.email, code, { purpose: "booking" });
+
+      // Extra dev visibility
+      if (String(process.env.OTP_DEBUG || "false") === "true" || process.env.NODE_ENV !== "production") {
+        console.log("🔐 Booking OTP for", user.email, ":", code);
+      }
+
+      return res.json({
+        ok: true,
+        requiresOtp: true,
+        message: "OTP sent to your email. Enter the code to confirm booking.",
+      });
+    }
+
+    // If OTP is required, verify it
+    if (requireOtp) {
+      const rawOtp = String(otp || "").trim();
+
+      if (!rawOtp) throw new AppError("OTP required", 400);
+      if (user.otpPurpose !== purpose || !user.otpHash) throw new AppError("No active OTP for booking", 400);
+      if (isOtpExpired(user.otpExpiresAt)) throw new AppError("OTP expired", 400);
+      if ((user.otpAttempts || 0) >= 5) throw new AppError("Too many OTP attempts", 429);
+
+      const expected = hashOtp({ otp: rawOtp, userId: user._id, purpose });
+      const ok = safeEqualHex(user.otpHash, expected);
+
+      if (!ok) {
+        user.otpAttempts = (user.otpAttempts || 0) + 1;
+        await user.save();
+        throw new AppError("Invalid OTP", 400);
+      }
+
+      // Clear OTP once used
+      user.otpHash = null;
+      user.otpPurpose = null;
+      user.otpExpiresAt = null;
+      user.otpAttempts = 0;
+      await user.save();
+    }
 
     // 1) Create appointment
     const appt = await Appointment.create({

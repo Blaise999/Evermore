@@ -18,7 +18,7 @@ function getTransport() {
   _tx = nodemailer.createTransport({
     host,
     port,
-    secure: port === 465, // true for 465, false for 587
+    secure: port === 465, // true for 465, false for 587 (STARTTLS)
     auth: { user, pass },
   });
 
@@ -26,13 +26,20 @@ function getTransport() {
 }
 
 async function sendMail({ to, subject, html, text, replyTo }) {
-  const from = process.env.MAIL_FROM || "Evermore Hospitals <no-reply@evermorehospitals.co.uk>";
+  const from = process.env.MAIL_FROM;
+
+  // ✅ in prod, force MAIL_FROM to be set (don’t silently use fallback)
+  if (process.env.NODE_ENV === "production" && !from) {
+    throw new Error("MAIL_FROM is not set");
+  }
+
+  const finalFrom = from || "Evermore Hospitals <no-reply@evermorehospitals.co.uk>";
   const transport = getTransport();
 
   return transport.sendMail({
-    from,
-    to,
-    subject,
+    from: finalFrom,
+    to: Array.isArray(to) ? to : String(to),
+    subject: String(subject || "").trim(),
     html,
     text,
     ...(replyTo ? { replyTo } : {}),

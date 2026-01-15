@@ -136,7 +136,7 @@ async function sendBrandedEmailToUser({ req, res, userId, subject, message, cta,
       provider: "resend",
       providerId: data?.id || null,
       ctaLabel: ctaLabel && ctaUrl ? ctaLabel : "",
-      ctaUrl: ctaLabel && ctaUrl ? ctaUrl : "",
+      ctaUrl: ctaLabel && ctaUrl ? ctaLabel : "",
       tags: extraTags,
       error: null,
     });
@@ -1233,7 +1233,17 @@ async function bulkCreateUserDataHandler(req, res) {
   const created = { appointments: 0, records: 0, invoices: 0 };
 
   const departments = ["Cardiology", "General Practice", "Radiology", "Dermatology", "Orthopedics", "Neurology"];
-  const doctors = ["Dr. Adebayo", "Dr. Musa", "Dr. Okafor", "Dr. Smith", "Dr. Garcia", "Dr. Chen"];
+
+  // ✅ UK-style clinician names (replaces NG/US/Intl mix)
+  const doctors = [
+    "Dr. James Smith",
+    "Dr. Emily Clarke",
+    "Dr. Oliver Patel",
+    "Dr. Sarah Williams",
+    "Dr. Thomas Johnson",
+    "Dr. Aisha Khan",
+  ];
+
   const recordTypes = ["consultation", "lab", "radiology", "prescription", "diagnosis", "discharge"];
 
   if (flags.appointments) {

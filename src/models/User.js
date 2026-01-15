@@ -13,10 +13,11 @@ const UserSchema = new mongoose.Schema(
 
     passwordHash: { type: String, required: true },
 
-    // OTP (password reset etc.)
+    // OTP (password reset / login / step-up)
     otpHash: { type: String, default: null },
-    otpPurpose: { type: String, enum: ["reset_password", "login", null], default: null },
+    otpPurpose: { type: String, enum: ["reset_password", "login", "portal_stepup", null], default: null },
     otpExpiresAt: { type: Date, default: null },
+    otpAttempts: { type: Number, default: 0 }, // ✅ minimal brute-force protection
 
     // ✅ Email verification
     emailVerifiedAt: { type: Date, default: null, index: true },
