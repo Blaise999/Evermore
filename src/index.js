@@ -19,49 +19,34 @@ async function boot() {
 
   const app = express();
 
-  // Trust proxy if behind reverse proxy (Vercel/NGINX/Render/etc.)
+  // Trust proxy if behind reverse proxy (Vercel/NGINX/etc.)
   app.set("trust proxy", 1);
 
   app.use(helmet());
-
-  // ✅ CORS configuration - more flexible
   app.use(
     cors({
       origin: (origin, cb) => {
-        // Parse allowed origins from env
+        // ✅ Safe defaults for local dev + Next.js same-origin proxying.
+        // If CORS_ORIGIN is empty, fall back to localhost:3000.
+        // Also allow requests with no Origin header (curl / server-to-server).
         const raw = String(process.env.CORS_ORIGIN || "");
         const allowed = raw
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean);
 
-        // Default fallback for development
         if (allowed.length === 0) {
           allowed.push("http://localhost:3000");
         }
 
-        // Allow requests with no Origin header (curl, server-to-server, mobile apps)
         if (!origin) return cb(null, true);
-
-        // Check if origin is in allowed list
         if (allowed.includes(origin)) return cb(null, true);
 
-        // Also allow any Vercel preview deployments (*.vercel.app)
-        if (origin.endsWith(".vercel.app")) return cb(null, true);
-
-        // Also allow localhost for development
-        if (origin.startsWith("http://localhost:")) return cb(null, true);
-
-        // Log rejected origins for debugging
-        console.warn(`[CORS] Blocked origin: ${origin}. Allowed: ${allowed.join(", ")}`);
         return cb(new Error(`CORS blocked for origin: ${origin}`));
       },
       credentials: true,
-      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
     })
   );
-
   app.use(express.json({ limit: "1mb" }));
   app.use(morgan("dev"));
 
@@ -75,15 +60,12 @@ async function boot() {
     })
   );
 
-  // Health check endpoint
   app.get("/health", (req, res) => res.json({ ok: true, service: "evermore-backend" }));
 
-  // API Routes
   app.use("/api/auth", authRoutes);
   app.use("/api/patient", patientRoutes);
   app.use("/api/admin", adminRoutes);
 
-  // Error handling
   app.use(notFound);
   app.use(errorHandler);
 
