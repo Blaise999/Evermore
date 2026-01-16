@@ -1,3 +1,4 @@
+// utils/emailverification.js
 const crypto = require("crypto");
 const { getResend } = require("./resendClient");
 const { renderBrandedEmail } = require("./brand");
@@ -10,6 +11,29 @@ function makeToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
+/**
+ * Hash an email verification token for storage.
+ * This is what gets stored in the database.
+ */
+function hashEmailVerifyToken(token) {
+  return sha256(token);
+}
+
+/**
+ * Check if a token is valid for a user.
+ * Compares hashes and checks expiration.
+ */
+function isEmailVerifyTokenValidForUser(user, token) {
+  if (!user?.emailVerifyTokenHash || !user?.emailVerifyTokenExpiresAt) return false;
+  const okHash = sha256(token) === user.emailVerifyTokenHash;
+  const okTime = new Date(user.emailVerifyTokenExpiresAt).getTime() > Date.now();
+  return okHash && okTime;
+}
+
+/**
+ * Send verification email to user.
+ * Creates token if needed, saves to user, sends email.
+ */
 async function sendVerificationEmail(user, { reason = "verify" } = {}) {
   const from = process.env.MAIL_FROM;
   if (!from) throw new Error("MAIL_FROM is not set");
@@ -17,42 +41,25 @@ async function sendVerificationEmail(user, { reason = "verify" } = {}) {
   const replyTo = process.env.MAIL_REPLY_TO || undefined;
   const appUrl = process.env.APP_URL || "http://localhost:3000";
 
-  // basic anti-spam: 60s cooldown
+  // Basic anti-spam: 60s cooldown
   const lastSent = user.emailVerifySentAt ? new Date(user.emailVerifySentAt).getTime() : 0;
   const now = Date.now();
   if (lastSent && now - lastSent < 60 * 1000) return { skipped: true };
 
-  // reuse existing token if still valid
-  let rawToken = null;
-  const hasValidExisting =
-    user.emailVerifyTokenHash &&
-    user.emailVerifyTokenExpiresAt &&
-    new Date(user.emailVerifyTokenExpiresAt).getTime() > now;
-
-  if (!hasValidExisting) {
-    rawToken = makeToken();
-    user.emailVerifyTokenHash = sha256(rawToken);
-    user.emailVerifyTokenExpiresAt = new Date(now + 60 * 60 * 1000); // 1 hour
-  }
-
-  // If we reused an old token, we cannot email it (we don't have raw token),
-  // so force regenerate when we need to send.
-  if (!rawToken) {
-    rawToken = makeToken();
-    user.emailVerifyTokenHash = sha256(rawToken);
-    user.emailVerifyTokenExpiresAt = new Date(now + 60 * 60 * 1000);
-  }
-
+  // Always generate a new token when sending email
+  const rawToken = makeToken();
+  user.emailVerifyTokenHash = sha256(rawToken);
+  user.emailVerifyTokenExpiresAt = new Date(now + 60 * 60 * 1000); // 1 hour
   user.emailVerifySentAt = new Date();
   await user.save();
 
-  const verifyUrl = `${appUrl}/verify-email?token=${rawToken}`;
+  const verifyUrl = `${appUrl}/api/auth/verify-email?token=${rawToken}`;
 
   const subject = "Verify your email address";
   const message =
     `Hi ${user.name ? String(user.name).trim() : "there"},\n\n` +
     `Please confirm your email address to activate your Evermore account.\n\n` +
-    `If you didn’t request this, you can ignore this email.`;
+    `If you didn't request this, you can ignore this email.`;
 
   const { html, text } = renderBrandedEmail({
     subject,
@@ -81,11 +88,17 @@ async function sendVerificationEmail(user, { reason = "verify" } = {}) {
   return { skipped: false, id: data?.id || null };
 }
 
+/**
+ * Legacy alias for backward compatibility.
+ * @deprecated Use isEmailVerifyTokenValidForUser instead
+ */
 function verifyEmailToken(user, token) {
-  if (!user?.emailVerifyTokenHash || !user?.emailVerifyTokenExpiresAt) return false;
-  const okHash = sha256(token) === user.emailVerifyTokenHash;
-  const okTime = new Date(user.emailVerifyTokenExpiresAt).getTime() > Date.now();
-  return okHash && okTime;
+  return isEmailVerifyTokenValidForUser(user, token);
 }
 
-module.exports = { sendVerificationEmail, verifyEmailToken };
+module.exports = {
+  sendVerificationEmail,
+  verifyEmailToken,
+  hashEmailVerifyToken,
+  isEmailVerifyTokenValidForUser,
+};
