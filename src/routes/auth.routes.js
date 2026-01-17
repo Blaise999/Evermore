@@ -1,7 +1,9 @@
 const express = require("express");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 
 const User = require("../models/User");
+const PendingUser = require("../models/PendingUser");
 const PatientAccount = require("../models/PatientAccount");
 const PatientProfile = require("../models/PatientProfile");
 const LoginEvent = require("../models/LoginEvent");
@@ -11,13 +13,8 @@ const auth = require("../middleware/auth");
 const { signAccessToken } = require("../utils/tokens");
 const { generateOtp, hashOtp, otpExpiresAt, isOtpExpired } = require("../utils/otp");
 const { auditLog } = require("../utils/audit");
-
-// ✅ email verify helpers
-const {
-  sendVerificationEmail,
-  hashEmailVerifyToken,
-  isEmailVerifyTokenValidForUser,
-} = require("../utils/emailverification");
+const { getResend } = require("../utils/resendClient");
+const { renderBrandedEmail } = require("../utils/brand");
 
 const router = express.Router();
 
@@ -36,6 +33,49 @@ function issueToken(user) {
     email: user.email,
     hospitalId: user.hospitalId,
   });
+}
+
+// Helper: send verification email to pending user
+async function sendPendingVerificationEmail(pendingUser, rawToken) {
+  const from = process.env.MAIL_FROM;
+  if (!from) throw new Error("MAIL_FROM is not set");
+
+  const replyTo = process.env.MAIL_REPLY_TO || undefined;
+  const appUrl = process.env.APP_URL || "http://localhost:3000";
+
+  const verifyUrl = `${appUrl}/api/auth/verify-email?token=${rawToken}`;
+
+  const subject = "Verify your email address";
+  const message =
+    `Hi ${pendingUser.name ? String(pendingUser.name).trim() : "there"},\n\n` +
+    `Please confirm your email address to complete your Evermore registration.\n\n` +
+    `This link expires in 1 hour.\n\n` +
+    `If you didn't request this, you can ignore this email.`;
+
+  const { html, text } = renderBrandedEmail({
+    subject,
+    message,
+    ctaLabel: "Verify email",
+    ctaUrl: verifyUrl,
+  });
+
+  const resend = await getResend();
+
+  const { data, error } = await resend.emails.send({
+    from,
+    to: [String(pendingUser.email).toLowerCase().trim()],
+    subject,
+    html,
+    text,
+    replyTo,
+    tags: [
+      { name: "type", value: "email_verification" },
+      { name: "reason", value: "signup" },
+    ],
+  });
+
+  if (error) throw new Error(error.message || "Failed to send email");
+  return { id: data?.id || null };
 }
 
 // Optional: seed admin on boot (safe for dev/demo)
@@ -61,6 +101,9 @@ async function seedAdminIfNeeded() {
 }
 seedAdminIfNeeded().catch(() => {});
 
+// ============================================
+// SIGNUP - Creates PendingUser, NOT User
+// ============================================
 router.post(
   "/signup",
   authLimiter,
@@ -68,56 +111,212 @@ router.post(
     const { name, email, password, phone } = req.body || {};
     if (!name || !email || !password) throw new AppError("name, email, password are required", 400);
 
-    const existing = await User.findOne({ email: String(email).toLowerCase() }).lean();
-    if (existing) throw new AppError("Email already in use", 409, "DUPLICATE");
+    const normalizedEmail = String(email).toLowerCase().trim();
 
-    const user = new User({
-      role: "patient",
+    // Check if email already exists as a verified user
+    const existingUser = await User.findOne({ email: normalizedEmail }).lean();
+    if (existingUser) throw new AppError("Email already in use", 409, "DUPLICATE");
+
+    // Check if there's already a pending registration for this email
+    // If so, delete it (allow re-registration)
+    await PendingUser.deleteOne({ email: normalizedEmail });
+
+    // Create pending user
+    const pendingUser = new PendingUser({
       name: String(name).trim(),
-      email: String(email).toLowerCase().trim(),
+      email: normalizedEmail,
       phone: phone ? String(phone).trim() : null,
-      passwordHash: "x",
-      emailVerifiedAt: null,
+      passwordHash: "x", // temporary, will be set below
     });
 
-    await user.setPassword(password);
-    await user.save();
+    await pendingUser.setPassword(password);
+    const rawToken = pendingUser.generateVerifyToken();
+    await pendingUser.save();
 
-    await PatientAccount.create({ userId: user._id });
-    await PatientProfile.create({
-      userId: user._id,
-      patientId: user.hospitalId,
-      fullName: user.name,
-      email: user.email,
-      phone: user.phone,
-      allergies: [],
-    });
+    // Send verification email
+    try {
+      await sendPendingVerificationEmail(pendingUser, rawToken);
+    } catch (e) {
+      // If email fails, delete the pending user so they can retry
+      await PendingUser.deleteOne({ _id: pendingUser._id });
+      console.error("Failed to send verification email:", e);
+      throw new AppError("Could not send verification email. Please try again.", 502, "EMAIL_SEND_FAILED");
+    }
 
-    await auditLog({
-      actorId: user._id,
-      actorRole: user.role,
-      action: "AUTH_SIGNUP",
-      targetModel: "User",
-      targetId: String(user._id),
-      after: user.safe(),
-      ip: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    // ✅ You said: send on login. So we DON'T auto-send here.
-    // If you want to send on signup too, uncomment:
-    // try { await sendVerificationEmail(user, { reason: "signup" }); } catch (e) {}
-
-    const token = issueToken(user);
+    console.log(`📧 Verification email sent to ${pendingUser.email}`);
 
     res.json({
       ok: true,
-      token,
-      user: user.safe(),
+      message: "Verification email sent. Please check your inbox.",
+      // DO NOT return token or user - they need to verify email first
     });
   })
 );
 
+// ============================================
+// VERIFY EMAIL - Moves PendingUser → User
+// ============================================
+router.get(
+  "/verify-email",
+  asyncHandler(async (req, res) => {
+    const token = String(req.query.token || "").trim();
+    if (!token) throw new AppError("token is required", 400);
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    
+    // First check PendingUser (new flow)
+    const pendingUser = await PendingUser.findOne({ emailVerifyToken: tokenHash });
+    
+    if (pendingUser) {
+      // Validate token
+      if (!pendingUser.isTokenValid(token)) {
+        const appUrl = process.env.APP_URL || "http://localhost:3000";
+        return res.redirect(`${appUrl}/verify-email/error?reason=expired`);
+      }
+
+      // Double-check email isn't taken (race condition protection)
+      const existingUser = await User.findOne({ email: pendingUser.email }).lean();
+      if (existingUser) {
+        await PendingUser.deleteOne({ _id: pendingUser._id });
+        const appUrl = process.env.APP_URL || "http://localhost:3000";
+        return res.redirect(`${appUrl}/verify-email/error?reason=duplicate`);
+      }
+
+      // Create the real user
+      const user = new User({
+        role: "patient",
+        name: pendingUser.name,
+        email: pendingUser.email,
+        phone: pendingUser.phone,
+        passwordHash: pendingUser.passwordHash, // Already hashed
+        emailVerifiedAt: new Date(),
+      });
+      await user.save();
+
+      // Create patient account and profile
+      await PatientAccount.create({ userId: user._id });
+      await PatientProfile.create({
+        userId: user._id,
+        patientId: user.hospitalId,
+        fullName: user.name,
+        email: user.email,
+        phone: user.phone,
+        allergies: [],
+      });
+
+      // Delete pending user
+      await PendingUser.deleteOne({ _id: pendingUser._id });
+
+      // Log the verification
+      await auditLog({
+        actorId: user._id,
+        actorRole: user.role,
+        action: "AUTH_SIGNUP_COMPLETED",
+        targetModel: "User",
+        targetId: String(user._id),
+        after: user.safe(),
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
+
+      console.log(`✅ User verified and created: ${user.email}`);
+
+      // Issue token and redirect to bank connect (next step in onboarding)
+      const accessToken = issueToken(user);
+      const appUrl = process.env.APP_URL || "http://localhost:3000";
+      
+      // Redirect to success page with token (frontend will store it and redirect to bank)
+      return res.redirect(`${appUrl}/verify-email/success?token=${accessToken}`);
+    }
+
+    // Fallback: Check if it's an existing user re-verifying (old flow compatibility)
+    const user = await User.findOne({ emailVerifyTokenHash: tokenHash });
+    if (user) {
+      const okHash = tokenHash === user.emailVerifyTokenHash;
+      const okTime = user.emailVerifyTokenExpiresAt && new Date(user.emailVerifyTokenExpiresAt).getTime() > Date.now();
+      
+      if (!okHash || !okTime) {
+        const appUrl = process.env.APP_URL || "http://localhost:3000";
+        return res.redirect(`${appUrl}/verify-email/error?reason=expired`);
+      }
+
+      user.emailVerifiedAt = new Date();
+      user.emailVerifyTokenHash = null;
+      user.emailVerifyTokenExpiresAt = null;
+      await user.save();
+
+      await auditLog({
+        actorId: user._id,
+        actorRole: user.role,
+        action: "AUTH_EMAIL_VERIFIED",
+        targetModel: "User",
+        targetId: String(user._id),
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
+
+      const accessToken = issueToken(user);
+      const appUrl = process.env.APP_URL || "http://localhost:3000";
+      return res.redirect(`${appUrl}/verify-email/success?token=${accessToken}`);
+    }
+
+    // Token not found
+    const appUrl = process.env.APP_URL || "http://localhost:3000";
+    return res.redirect(`${appUrl}/verify-email/error?reason=invalid`);
+  })
+);
+
+// ============================================
+// RESEND VERIFICATION - Works with PendingUser
+// ============================================
+router.post(
+  "/resend-verification",
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const email = String(req.body?.email || "").toLowerCase().trim();
+    if (!email) throw new AppError("email is required", 400);
+
+    // Check PendingUser first (new flow)
+    const pendingUser = await PendingUser.findOne({ email });
+    if (pendingUser) {
+      // Check cooldown
+      if (!pendingUser.canResendEmail()) {
+        return res.json({ ok: true, message: "If an account exists, a verification email was sent." });
+      }
+
+      const rawToken = pendingUser.generateVerifyToken();
+      await pendingUser.save();
+
+      try {
+        await sendPendingVerificationEmail(pendingUser, rawToken);
+      } catch (e) {
+        console.error("Failed to resend verification email:", e);
+        // Don't throw - just return ok to prevent enumeration
+      }
+
+      return res.json({ ok: true, message: "Verification email resent." });
+    }
+
+    // Check existing User (old flow - for unverified existing users)
+    const user = await User.findOne({ email });
+    if (user && !user.emailVerifiedAt) {
+      // Import the old sendVerificationEmail for backward compatibility
+      const { sendVerificationEmail } = require("../utils/emailverification");
+      try {
+        await sendVerificationEmail(user, { reason: "manual_resend" });
+      } catch (e) {
+        // Silently fail to prevent enumeration
+      }
+    }
+
+    // Always return ok (don't leak whether email exists)
+    res.json({ ok: true, message: "If an account exists, a verification email was sent." });
+  })
+);
+
+// ============================================
+// LOGIN - Only works for verified users
+// ============================================
 router.post(
   "/login",
   authLimiter,
@@ -125,29 +324,41 @@ router.post(
     const { email, password } = req.body || {};
     if (!email || !password) throw new AppError("email and password are required", 400);
 
-    const user = await User.findOne({ email: String(email).toLowerCase().trim() });
-    if (!user || !user.isActive) throw new AppError("Invalid credentials", 401, "UNAUTHORIZED");
+    const normalizedEmail = String(email).toLowerCase().trim();
 
-    const ok = await user.verifyPassword(password);
-    if (!ok) throw new AppError("Invalid credentials", 401, "UNAUTHORIZED");
-
-    // ✅ If patient not verified: send email + block login
-    if (user.role === "patient" && !user.emailVerifiedAt) {
-      try {
-        await sendVerificationEmail(user, { reason: "login" });
-      } catch (e) {
-        // if resend fails, still block login, but with clearer error
-        throw new AppError("Email not verified and we could not send verification email. Try again.", 502, "EMAIL_SEND_FAILED");
-      }
-
+    // Check if there's a pending registration
+    const pendingUser = await PendingUser.findOne({ email: normalizedEmail }).lean();
+    if (pendingUser) {
       throw new AppError(
-        "Email not verified. We’ve sent you a verification link.",
+        "Please verify your email first. Check your inbox for the verification link.",
         403,
         "EMAIL_NOT_VERIFIED"
       );
     }
 
-    // Track successful logins for the admin panel.
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || !user.isActive) throw new AppError("Invalid credentials", 401, "UNAUTHORIZED");
+
+    const ok = await user.verifyPassword(password);
+    if (!ok) throw new AppError("Invalid credentials", 401, "UNAUTHORIZED");
+
+    // If patient not verified (legacy users)
+    if (user.role === "patient" && !user.emailVerifiedAt) {
+      const { sendVerificationEmail } = require("../utils/emailverification");
+      try {
+        await sendVerificationEmail(user, { reason: "login" });
+      } catch (e) {
+        throw new AppError("Email not verified and we could not send verification email. Try again.", 502, "EMAIL_SEND_FAILED");
+      }
+
+      throw new AppError(
+        "Email not verified. We've sent you a verification link.",
+        403,
+        "EMAIL_NOT_VERIFIED"
+      );
+    }
+
+    // Track successful logins
     user.lastLoginAt = new Date();
     await user.save();
     await LoginEvent.create({
@@ -173,62 +384,9 @@ router.post(
   })
 );
 
-// ✅ Verify email link
-// GET /api/auth/verify-email?token=...
-router.get(
-  "/verify-email",
-  asyncHandler(async (req, res) => {
-    const token = String(req.query.token || "").trim();
-    if (!token) throw new AppError("token is required", 400);
-
-    const tokenHash = hashEmailVerifyToken(token);
-    const user = await User.findOne({ emailVerifyTokenHash: tokenHash });
-    if (!user) throw new AppError("Invalid or expired token", 400, "BAD_TOKEN");
-
-    const ok = isEmailVerifyTokenValidForUser(user, token);
-    if (!ok) throw new AppError("Invalid or expired token", 400, "BAD_TOKEN");
-
-    user.emailVerifiedAt = new Date();
-    user.emailVerifyTokenHash = null;
-    user.emailVerifyTokenExpiresAt = null;
-    await user.save();
-
-    await auditLog({
-      actorId: user._id,
-      actorRole: user.role,
-      action: "AUTH_EMAIL_VERIFIED",
-      targetModel: "User",
-      targetId: String(user._id),
-      ip: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    // you can redirect to frontend success page
-    const appUrl = process.env.APP_URL || "http://localhost:3000";
-    return res.redirect(`${appUrl}/verify-email/success`);
-  })
-);
-
-// ✅ Optional: allow resending verification email (helpful for UI button)
-// POST /api/auth/resend-verification  { email }
-router.post(
-  "/resend-verification",
-  authLimiter,
-  asyncHandler(async (req, res) => {
-    const email = String(req.body?.email || "").toLowerCase().trim();
-    if (!email) throw new AppError("email is required", 400);
-
-    const user = await User.findOne({ email });
-    // Always respond ok (don’t leak)
-    if (!user) return res.json({ ok: true });
-
-    if (user.emailVerifiedAt) return res.json({ ok: true });
-
-    await sendVerificationEmail(user, { reason: "manual_resend" });
-    res.json({ ok: true });
-  })
-);
-
+// ============================================
+// ME - Get current user
+// ============================================
 router.get(
   "/me",
   auth,
@@ -246,7 +404,9 @@ router.get(
   })
 );
 
-// Forgot password -> OTP
+// ============================================
+// FORGOT PASSWORD
+// ============================================
 router.post(
   "/forgot-password",
   authLimiter,
@@ -255,7 +415,7 @@ router.post(
     if (!email) throw new AppError("email is required", 400);
 
     const user = await User.findOne({ email: String(email).toLowerCase().trim() });
-    // Always respond ok (don’t leak existence)
+    // Always respond ok (don't leak existence)
     if (!user) return res.json({ ok: true, message: "If the email exists, an OTP was sent." });
 
     const otp = generateOtp();
@@ -274,7 +434,6 @@ router.post(
       userAgent: req.headers["user-agent"],
     });
 
-    // Demo behavior: print OTP / optionally return it if OTP_DEBUG=true
     console.log(`🔐 OTP for ${user.email}:`, otp);
 
     const debug = String(process.env.OTP_DEBUG || "false") === "true";
@@ -286,7 +445,9 @@ router.post(
   })
 );
 
-// Reset password with OTP
+// ============================================
+// RESET PASSWORD
+// ============================================
 router.post(
   "/reset-password",
   authLimiter,

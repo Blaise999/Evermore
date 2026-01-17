@@ -39,7 +39,7 @@ async function sendVerificationEmail(user, { reason = "verify" } = {}) {
   if (!from) throw new Error("MAIL_FROM is not set");
 
   const replyTo = process.env.MAIL_REPLY_TO || undefined;
-  const appUrl = process.env.APP_URL || "http://localhost:3000";
+  const appUrl = process.env.APP_URL || "http://wallace:3000";
 
   // Basic anti-spam: 60s cooldown
   const lastSent = user.emailVerifySentAt ? new Date(user.emailVerifySentAt).getTime() : 0;
