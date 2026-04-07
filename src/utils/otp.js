@@ -22,9 +22,10 @@ function isOtpExpired(expiresAt) {
 
 // ✅ makes OTP unique to user + purpose (no "one OTP for all")
 function hashOtp({ otp, userId, purpose }) {
-  if (!OTP_SECRET) throw new Error("OTP_SECRET is not set");
+  // Use OTP_SECRET if set, otherwise fallback for dev/demo
+  const secret = OTP_SECRET || "evermore-dev-otp-secret-change-in-production";
   const msg = `${String(userId)}|${String(purpose)}|${String(otp)}`;
-  return crypto.createHmac("sha256", OTP_SECRET).update(msg).digest("hex");
+  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
 
 function safeEqualHex(a, b) {

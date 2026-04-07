@@ -153,15 +153,15 @@ async function applyCareflexRepaymentOldestFirst(userId, amountEUR) {
 async function ensureAccountForUser(userId) {
   let account = await PatientAccount.findOne({ userId });
   if (!account) {
-    account = await PatientAccount.create({ userId, currency: "EUR", creditLimit: 5000, amountOwed: 0, balance: 0 });
+    account = await PatientAccount.create({ userId, currency: "GBP", creditLimit: 1000, amountOwed: 0, balance: 0 });
   }
   return account;
 }
 
 async function syncAccountFromInvoices(userId) {
   const account = await ensureAccountForUser(userId);
-  account.currency = "EUR";
-  if (!Number.isFinite(Number(account.creditLimit)) || Number(account.creditLimit) <= 0) account.creditLimit = 5000;
+  account.currency = "GBP";
+  if (!Number.isFinite(Number(account.creditLimit)) || Number(account.creditLimit) <= 0) account.creditLimit = 1000;
   account.amountOwed = await computeOutstandingOwedEUR(userId);
   await account.save();
   return account;
@@ -225,21 +225,32 @@ router.get(
       prof = created.toObject();
     }
 
+    // Ailment spend breakdown
+    const ailmentSpend = {};
+    for (const inv of invoices) {
+      if (inv.status === "void") continue;
+      const ailment = inv.ailment || "General";
+      if (!ailmentSpend[ailment]) ailmentSpend[ailment] = { total: 0, covered: 0, outstanding: 0 };
+      ailmentSpend[ailment].total += Number(inv.total) || 0;
+      ailmentSpend[ailment].covered += Number(inv.coveredAmount) || 0;
+      ailmentSpend[ailment].outstanding = ailmentSpend[ailment].total - ailmentSpend[ailment].covered;
+    }
     res.json({
       ok: true,
       user: user.safe(),
       profile: prof,
       account: account || null,
       careflex: {
-        currency: "EUR",
-        limit: n2(account?.creditLimit ?? 5000),
+        currency: "GBP",
+        limit: n2(account?.creditLimit ?? 1000),
         owed,
-        available: n2((account?.creditLimit ?? 5000) - owed),
+        available: n2((account?.creditLimit ?? 1000) - owed),
       },
       appointments,
       records,
       invoices,
       payments,
+      ailmentSpend,
     });
   })
 );
@@ -387,7 +398,7 @@ router.post(
       userId,
       hospitalId,
       appointmentId: appt._id,
-      currency: "EUR",
+      currency: "GBP",
       status: payNow ? "paid" : "issued",
       issuedAt: new Date(),
       dueDate,
@@ -411,7 +422,7 @@ router.post(
         userId,
         invoiceId: inv._id,
         reference: paymentRef,
-        currency: "EUR",
+        currency: "GBP",
         amount: total,
         kind: "invoice_payment",
         status: "approved",
@@ -495,7 +506,7 @@ router.post(
       userId,
       invoiceId: inv ? inv._id : null,
       reference,
-      currency: currency || (inv ? inv.currency : "EUR"),
+      currency: currency || (inv ? inv.currency : "GBP"),
       amount: amt,
       method: method || "card",
       status: "approved", // <-- change if your enum differs
@@ -542,7 +553,7 @@ router.post(
     if (!Number.isFinite(amount) || amount <= 0) throw new AppError("Invalid amount", 400);
 
     const account = await PatientAccount.findOne({ userId }).lean();
-    const limit = n2(account?.creditLimit ?? 5000);
+    const limit = n2(account?.creditLimit ?? 1000);
 
     const reference = makeRequestRef("CFX");
 
@@ -554,7 +565,7 @@ router.post(
       userId,
       invoiceId: null,
       reference,
-      currency: "EUR",
+      currency: "GBP",
       amount,
       kind: "careflex_repayment",
       applied,
@@ -585,9 +596,39 @@ router.post(
       ok: true,
       paymentRequest: pr,
       applied,
-      careflex: { currency: "EUR", owed: owedNow, limit: limitNow, available: n2(limitNow - owedNow) },
+      careflex: { currency: "GBP", owed: owedNow, limit: limitNow, available: n2(limitNow - owedNow) },
     });
   })
 );
 
 module.exports = router;
+
+// Invoice PDF for patients
+const { generateReceiptPdf } = require("../utils/receiptPdf");
+
+router.get(
+  "/invoices/:invoiceId/pdf",
+  asyncHandler(async (req, res) => {
+    const inv = await Invoice.findOne({ _id: req.params.invoiceId, userId: req.user.id }).lean();
+    if (!inv) throw new AppError("Invoice not found", 404);
+
+    const user = await User.findById(req.user.id).lean();
+    const profile = await PatientProfile.findOne({ userId: req.user.id }).lean();
+
+    const pdfBuffer = await generateReceiptPdf(inv, {
+      fullName: profile?.fullName || user?.name || "Patient",
+      email: profile?.email || user?.email || "",
+      phone: profile?.phone || user?.phone || "",
+      patientId: profile?.patientId || user?.hospitalId || "",
+    }, {
+      name: "Evermore Hospitals",
+      address: ["145 Harley Street", "London, W1G 6BJ", "United Kingdom"],
+      phone: "+44 20 7946 0958",
+      email: "billing@evermore.health",
+    });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="Evermore-Invoice-${inv.invoiceNo || "receipt"}.pdf"`);
+    res.send(pdfBuffer);
+  })
+);
