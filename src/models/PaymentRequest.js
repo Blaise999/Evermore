@@ -15,7 +15,7 @@ const PaymentRequestSchema = new mongoose.Schema(
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: "Invoice", default: null, index: true },
 
     reference: { type: String, required: true, unique: true, index: true },
-    currency: { type: String, default: "EUR" },
+    currency: { type: String, default: "GBP" },
     amount: { type: Number, required: true },
 
     // ✅ What kind of payment this is.

@@ -5,8 +5,8 @@
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "start": "node src/index.js"
+    "dev": "node init && nodemon src/index.js",
+    "start": "node init && node src/index.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

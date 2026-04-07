@@ -22,7 +22,12 @@ const InvoiceSchema = new mongoose.Schema(
     appointmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Appointment", required: true, index: true },
 
     // Billing is EUR-only for CareFlex (Option A)
-    currency: { type: String, default: "EUR" },
+    currency: { type: String, default: "GBP" },
+
+    // Ailment tracking
+    ailment: { type: String, default: null, trim: true },
+    ailmentCode: { type: String, default: null, trim: true },
+    diagnosis: { type: String, default: null, trim: true },
 
     status: {
       type: String,

@@ -48,6 +48,7 @@ async function boot() {
     })
   );
   app.use(express.json({ limit: "1mb" }));
+  app.use("/public", express.static("public"));
   app.use(morgan("dev"));
 
   // Basic global rate limit
